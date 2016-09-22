@@ -1,2 +1,4 @@
-all:
-	gcc -o bin/sh sh.c -O0 -ggdb
+build:
+	gcc sh.c -o sh
+clean:
+	rm -f sh
