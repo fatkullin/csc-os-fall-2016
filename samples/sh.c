@@ -4,12 +4,15 @@
 #include <fcntl.h>
 #include <string.h>
 #include <assert.h>
+#include <errno.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 
 // Simplifed xv6 shell.
 
 #define MAXARGS 10
+#define MAXSTRINGLEN 200
 
 // All commands have at least a type. Have looked at the type, the code
 // typically casts the *cmd to some specific cmd type.
@@ -23,7 +26,7 @@ struct execcmd {
 };
 
 struct redircmd {
-  int type;          // < or > 
+  int type;          // < or >
   struct cmd *cmd;   // the command to be run (e.g., an execcmd)
   char *file;        // the input/output file
   int mode;          // the mode to open the file with
@@ -39,18 +42,98 @@ struct pipecmd {
 int fork1(void);  // Fork but exits on failure.
 struct cmd *parsecmd(char*);
 
+int dumpdesc;    //descriptor of dbg output
+#ifdef _DEBUG
+
+  #define INIT_DUMP(fd) dumpdesc = dup(fd)
+  #define DBG(fmt, ...)                                   \
+    if (dumpdesc != 0)                                      \
+    {                                                       \
+        char buffer[100];                                   \
+        int len = snprintf(buffer, 100, fmt, ##__VA_ARGS__);\
+        write(dumpdesc, buffer, len);                       \
+    }\
+
+#else
+  #define INIT_DUMP(fd) (void)fd;
+  #define DBG(fmt, ...) (void)fmt;
+#endif
+
+//return pointer to string end
+//memory safe
+char*
+format_execcmd_text(struct execcmd* ecmd, char* output, size_t size)
+{
+    char* end = output;
+    if (ecmd) {
+        int i = 0;
+        while (ecmd->argv[i]) {
+            end += snprintf(end, size - (end - output), "%s ", ecmd->argv[i]);
+            ++i;
+        }
+        end -= 1; *end = 0; //pop last space
+    }
+    return end;
+}
+
+//return pointer to string end
+//memory safe
+char*
+format_cmd_text(struct cmd* cmd, char* output, size_t size)
+{
+    char* end;
+    struct redircmd* rcmd;
+    struct pipecmd* pcmd;
+
+    switch(cmd->type){
+    case ' ':
+        return format_execcmd_text((struct execcmd*)cmd, output, size);
+    case '>':
+    case '<':
+        rcmd = (struct redircmd*)cmd;
+        end = format_cmd_text(rcmd->cmd, output, size);
+        end += snprintf(end, size - (end - output), " %c %s", cmd->type, rcmd->file);
+        return end;
+    case '|':
+        pcmd = (struct pipecmd*)cmd;
+        end = format_cmd_text(pcmd->left, output, size);
+        end += snprintf(end, size - (end - output), " | ");
+        end = format_cmd_text(pcmd->right, end, size - (end - output));
+        return end;
+    }
+    return output;
+}
+
+// perror plus cmd text
+// Save errno value.
+// Print error in format:
+// <additional_info>, command <cmd text>: <errno text>\n
+void
+print_comman_error(struct cmd* cmd, char* additional_info)
+{
+    int error = errno;
+    char buffer[MAXSTRINGLEN];
+    memset(buffer, 0, sizeof(buffer));
+    format_cmd_text(cmd, buffer, MAXSTRINGLEN);
+    if (additional_info)
+        fprintf(stderr, "%s, command %s: %s\n", additional_info, buffer, strerror(error));
+    else
+        fprintf(stderr, "command %s: %s\n", buffer, strerror(error));
+    errno = error;
+}
+
 // Execute cmd.  Never returns.
 void
 runcmd(struct cmd *cmd)
 {
-  int p[2], r;
+  int p[2], r, exstat;
   struct execcmd *ecmd;
   struct pipecmd *pcmd;
   struct redircmd *rcmd;
 
   if(cmd == 0)
     exit(0);
-  
+
   switch(cmd->type){
   default:
     fprintf(stderr, "unknown runcmd\n");
@@ -60,31 +143,102 @@ runcmd(struct cmd *cmd)
     ecmd = (struct execcmd*)cmd;
     if(ecmd->argv[0] == 0)
       exit(0);
-    fprintf(stderr, "exec not implemented\n");
-    // Your code here ...
+    if (execvp(ecmd->argv[0], ecmd->argv)) {
+      print_comman_error(cmd, "command execution");
+      exit(errno);
+    }
     break;
 
   case '>':
   case '<':
     rcmd = (struct redircmd*)cmd;
-    fprintf(stderr, "redir not implemented\n");
-    // Your code here ...
+
+    r = open(rcmd->file, rcmd->mode, S_IRWXU);
+    if (r < 0) {
+        print_comman_error(cmd, "open file");
+        exit(errno);
+    }
+
+    if (dup2(r, rcmd->fd) < 0) {
+        print_comman_error(cmd, "io descriptor replacement");
+        exit(errno);
+    }
+
+    if (close(r) < 0) {
+        print_comman_error(cmd, "close dub desc");
+        exit(errno);
+    }
+
     runcmd(rcmd->cmd);
     break;
 
   case '|':
-    pcmd = (struct pipecmd*)cmd;
-    fprintf(stderr, "pipe not implemented\n");
-    // Your code here ...
+    {
+        pcmd = (struct pipecmd*)cmd;
+
+        if (pipe(p) < 0)
+            print_comman_error(cmd, "pipe creation");
+
+        int leftpid = fork1();
+        if (leftpid == 0) { // left child process
+            if (dup2(p[1], fileno(stdout)) < 0) {
+                print_comman_error(cmd, "output replacement");
+                exit(errno);
+            }
+
+            if (close(p[0]) < 0) {
+                print_comman_error(cmd, "pipe close out");
+                exit(errno);
+            }
+
+            runcmd(pcmd->left);
+        }
+
+        if (close(p[1]) < 0) { // terminate left process and exit
+            int err = errno;
+            print_comman_error(cmd, "pipe close in");
+
+            DBG("Terminate child: %d\n", leftpid);
+            if (kill(leftpid, SIGTERM) < 0)
+                perror("kill left child pipe process");
+            exit(err);
+        }
+
+        int rightpid = fork1();
+        if (rightpid == 0) { // right child process
+            if (dup2(p[0], fileno(stdin)) < 0) {
+                print_comman_error(cmd, "input replacement");
+                exit(errno);
+            }
+
+            runcmd(pcmd->right);
+        }
+
+        waitpid(leftpid, &exstat, 0);
+        int leftcode = WEXITSTATUS(exstat);
+        DBG("Child %d exit code: %d\n", leftpid, leftcode);
+        if (leftcode != 0) { // terminate right process and exit
+            DBG("Terminate child: %d\n", rightpid);
+            if (kill(rightpid, SIGTERM) < 0)
+                perror("kill right child pipe process");
+            exit(leftcode);
+        }
+
+        waitpid(rightpid, &exstat, 0);
+        int rightcode = WEXITSTATUS(exstat);
+        DBG("Child %d exit code: %d\n", rightpid, rightcode);
+        exit(rightcode);
+    }
+
     break;
-  }    
+  }
   exit(0);
 }
 
 int
 getcmd(char *buf, int nbuf)
 {
-  
+
   if (isatty(fileno(stdin)))
     fprintf(stdout, "$ ");
   memset(buf, 0, nbuf);
@@ -97,11 +251,12 @@ getcmd(char *buf, int nbuf)
 int
 main(void)
 {
+  INIT_DUMP(STDOUT_FILENO);
   static char buf[100];
-  int fd, r;
+  int r = 0, exitcode = 0;
 
   // Read and run input commands.
-  while(getcmd(buf, sizeof(buf)) >= 0){
+  while(exitcode == 0 && getcmd(buf, sizeof(buf)) >= 0){
     if(buf[0] == 'c' && buf[1] == 'd' && buf[2] == ' '){
       // Clumsy but will have to do for now.
       // Chdir has no effect on the parent if run in the child.
@@ -110,21 +265,30 @@ main(void)
         fprintf(stderr, "cannot cd %s\n", buf+3);
       continue;
     }
-    if(fork1() == 0)
-      runcmd(parsecmd(buf));
-    wait(&r);
+    int pid = fork1();
+    if(pid == 0) {
+        runcmd(parsecmd(buf));
+    }
+    waitpid(pid, &r, 0);
+    exitcode = WEXITSTATUS(r);
+    DBG("Child %d exit code: %d\n", pid, exitcode);
   }
-  exit(0);
+  exit(exitcode);
 }
 
 int
 fork1(void)
 {
   int pid;
-  
+
   pid = fork();
-  if(pid == -1)
+  if(pid == -1)  {
     perror("fork");
+    exit(errno);
+  }
+  else if (pid != 0) {
+    DBG("Child PID: %d\n", pid);
+  }
   return pid;
 }
 
@@ -177,7 +341,7 @@ gettoken(char **ps, char *es, char **q, char **eq)
 {
   char *s;
   int ret;
-  
+
   s = *ps;
   while(s < es && strchr(whitespace, *s))
     s++;
@@ -202,7 +366,7 @@ gettoken(char **ps, char *es, char **q, char **eq)
   }
   if(eq)
     *eq = s;
-  
+
   while(s < es && strchr(whitespace, *s))
     s++;
   *ps = s;
@@ -213,7 +377,7 @@ int
 peek(char **ps, char *es, char *toks)
 {
   char *s;
-  
+
   s = *ps;
   while(s < es && strchr(whitespace, *s))
     s++;
@@ -227,7 +391,7 @@ struct cmd *parseexec(char**, char*);
 
 // make a copy of the characters in the input buffer, starting from s through es.
 // null-terminate the copy to make it a string.
-char 
+char
 *mkcopy(char *s, char *es)
 {
   int n = es - s;
@@ -306,7 +470,7 @@ parseexec(char **ps, char *es)
   int tok, argc;
   struct execcmd *cmd;
   struct cmd *ret;
-  
+
   ret = execcmd();
   cmd = (struct execcmd*)ret;
 
