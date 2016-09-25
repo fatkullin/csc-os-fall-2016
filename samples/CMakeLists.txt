@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.6)
 project(samples)
 
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Werror -O0 -ggdb")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0 -ggdb") #-Wall -Werror
 
 set(SOURCES sh.c)
 
